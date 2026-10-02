@@ -1,0 +1,308 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <title>Usability Tracker v2 (demo)</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 24px; line-height: 1.5; }
+    .bar { position: sticky; top: 0; background: #fff; padding: 8px 0; display: flex; gap: 8px; flex-wrap: wrap; z-index: 10; }
+    button { padding: 8px 12px; cursor: pointer; }
+    .block { height: 420px; margin: 16px 0; padding: 16px; border: 1px solid #ccc; border-radius: 8px; }
+    pre { background: #f4f4f4; padding: 12px; max-height: 260px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <div class="bar">
+    <button id="btn-summary">Show summary</button>
+    <button id="btn-heatmap">Toggle heatmap</button>
+    <button id="btn-xml">Download XML</button>
+  </div>
+  <h1>Usability Tracker v2</h1>
+  <p>Click, move, scroll and rage-click on this page, then use the buttons above.</p>
+  <div class="block">Section 1</div>
+  <div class="block">Section 2</div>
+  <div class="block">Section 3</div>
+  <pre id="out">Output appears here...</pre>
+
+  <script><![CDATA[
+/**
+ * Usability Tracker v2
+ * Captures clicks, mouse movement, scroll depth, rage clicks, dead clicks,
+ * visibility changes and touch taps. Exports JSON or XML, renders a canvas
+ * heatmap, and can optionally batch-send events to an endpoint.
+ */
+(function () {
+  'use strict';
+
+  var CONFIG = {
+    moveSampleMs: 100,          // mouse move sampling interval
+    maxEvents: 5000,            // ring-buffer cap to protect memory
+    rageClicks: 3,              // clicks within window = rage click
+    rageWindowMs: 800,
+    rageRadiusPx: 30,
+    scrollMilestones: [25, 50, 75, 100],
+    endpoint: null,             // e.g. '/analytics' to enable batching
+    flushIntervalMs: 10000,
+    persist: true,              // keep logs in sessionStorage
+    storageKey: 'ut_logs_v2'
+  };
+
+  var SESSION_ID = 's_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  var START = performance.now();
+  var logs = [];
+  var pending = [];
+  var recentClicks = [];
+  var reached = {};
+  var maxScroll = 0;
+
+  // ---------- helpers ----------
+  function docSize() {
+    var d = document.documentElement, b = document.body;
+    return {
+      w: Math.max(d.scrollWidth, b ? b.scrollWidth : 0, d.clientWidth),
+      h: Math.max(d.scrollHeight, b ? b.scrollHeight : 0, d.clientHeight)
+    };
+  }
+
+  function pagePoint(e) {
+    var p = e.touches && e.touches[0] ? e.touches[0] : (e.changedTouches && e.changedTouches[0]) || e;
+    return {
+      x: Math.round(p.clientX + window.pageXOffset),
+      y: Math.round(p.clientY + window.pageYOffset)
+    };
+  }
+
+  // Short CSS selector path, e.g. div#app > ul > li:nth-child(3)
+  function selectorOf(el) {
+    var parts = [];
+    while (el && el.nodeType === 1 && parts.length < 5) {
+      var s = el.tagName.toLowerCase();
+      if (el.id) { parts.unshift(s + '#' + el.id); break; }
+      var parent = el.parentNode;
+      if (parent) {
+        var idx = Array.prototype.indexOf.call(parent.children, el) + 1;
+        s += ':nth-child(' + idx + ')';
+      }
+      parts.unshift(s);
+      el = parent;
+    }
+    return parts.join(' > ');
+  }
+
+  // Privacy: never record text from form fields
+  function safeText(el) {
+    if (!el) return '';
+    var tag = el.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable) return '[redacted]';
+    return (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 30);
+  }
+
+  function isInteractive(el) {
+    return !!(el && el.closest && el.closest('a,button,input,select,textarea,label,summary,[role="button"],[onclick],[tabindex]'));
+  }
+
+  function push(entry) {
+    entry.sessionId = SESSION_ID;
+    entry.timestamp = new Date().toISOString();
+    entry.t = Math.round(performance.now() - START);
+    logs.push(entry);
+    if (logs.length > CONFIG.maxEvents) logs.shift();
+    if (CONFIG.endpoint) pending.push(entry);
+  }
+
+  function persist() {
+    if (!CONFIG.persist) return;
+    try { sessionStorage.setItem(CONFIG.storageKey, JSON.stringify(logs.slice(-1000))); } catch (e) {}
+  }
+
+  // ---------- clicks, rage clicks, dead clicks ----------
+  function onClick(e) {
+    var t = e.target, pt = pagePoint(e), now = performance.now();
+    push({
+      type: 'click', x: pt.x, y: pt.y,
+      tag: t.tagName, id: t.id || null,
+      cls: typeof t.className === 'string' ? t.className : null,
+      selector: selectorOf(t), text: safeText(t),
+      vw: window.innerWidth, vh: window.innerHeight
+    });
+
+    if (!isInteractive(t)) push({ type: 'deadclick', x: pt.x, y: pt.y, selector: selectorOf(t) });
+
+    recentClicks = recentClicks.filter(function (c) { return now - c.t < CONFIG.rageWindowMs; });
+    recentClicks.push({ t: now, x: pt.x, y: pt.y });
+    var near = recentClicks.filter(function (c) {
+      return Math.hypot(c.x - pt.x, c.y - pt.y) <= CONFIG.rageRadiusPx;
+    });
+    if (near.length >= CONFIG.rageClicks) {
+      push({ type: 'rageclick', x: pt.x, y: pt.y, selector: selectorOf(t), count: near.length });
+      recentClicks = [];
+    }
+  }
+  document.addEventListener('click', onClick, true);
+
+  // ---------- touch taps ----------
+  document.addEventListener('touchend', function (e) {
+    var pt = pagePoint(e);
+    push({ type: 'tap', x: pt.x, y: pt.y, selector: selectorOf(e.target) });
+  }, { passive: true, capture: true });
+
+  // ---------- mouse movement (rAF + time throttled) ----------
+  var lastMove = 0, moveQueued = false, lastEvt = null;
+  document.addEventListener('mousemove', function (e) {
+    lastEvt = e;
+    if (moveQueued) return;
+    moveQueued = true;
+    requestAnimationFrame(function () {
+      moveQueued = false;
+      var now = performance.now();
+      if (now - lastMove < CONFIG.moveSampleMs || !lastEvt) return;
+      lastMove = now;
+      var pt = pagePoint(lastEvt);
+      push({ type: 'mousemove', x: pt.x, y: pt.y });
+    });
+  }, { passive: true });
+
+  // ---------- scroll depth ----------
+  var scrollQueued = false;
+  window.addEventListener('scroll', function () {
+    if (scrollQueued) return;
+    scrollQueued = true;
+    requestAnimationFrame(function () {
+      scrollQueued = false;
+      var size = docSize();
+      var seen = window.pageYOffset + window.innerHeight;
+      var pct = Math.min(100, Math.round((seen / size.h) * 100));
+      if (pct > maxScroll) maxScroll = pct;
+      CONFIG.scrollMilestones.forEach(function (m) {
+        if (pct >= m && !reached[m]) {
+          reached[m] = true;
+          push({ type: 'scrolldepth', percent: m });
+        }
+      });
+    });
+  }, { passive: true });
+
+  // ---------- visibility / lifecycle ----------
+  document.addEventListener('visibilitychange', function () {
+    push({ type: 'visibility', state: document.visibilityState });
+    if (document.visibilityState === 'hidden') { persist(); flush(true); }
+  });
+  window.addEventListener('pagehide', function () { persist(); flush(true); });
+
+  // ---------- optional batching ----------
+  function flush(useBeacon) {
+    if (!CONFIG.endpoint || !pending.length) return;
+    var payload = JSON.stringify({ sessionId: SESSION_ID, events: pending });
+    pending = [];
+    if (useBeacon && navigator.sendBeacon) {
+      navigator.sendBeacon(CONFIG.endpoint, payload);
+    } else {
+      fetch(CONFIG.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: payload, keepalive: true })
+        .catch(function () {});
+    }
+  }
+  setInterval(function () { flush(false); persist(); }, CONFIG.flushIntervalMs);
+
+  // ---------- summary ----------
+  function summary() {
+    var counts = {};
+    logs.forEach(function (l) { counts[l.type] = (counts[l.type] || 0) + 1; });
+    return {
+      sessionId: SESSION_ID,
+      durationMs: Math.round(performance.now() - START),
+      totalEvents: logs.length,
+      maxScrollPercent: maxScroll,
+      counts: counts,
+      page: location.href,
+      document: docSize()
+    };
+  }
+
+  // ---------- exports ----------
+  function esc(v) {
+    return String(v).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[c];
+    }).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
+  }
+
+  function toXML() {
+    var s = summary();
+    var x = '<?xml version="1.0" encoding="UTF-8"?>\n';
+    x += '<usabilitySession id="' + esc(s.sessionId) + '" page="' + esc(s.page) + '" durationMs="' + s.durationMs + '">\n';
+    x += '  <summary totalEvents="' + s.totalEvents + '" maxScrollPercent="' + s.maxScrollPercent + '"';
+    x += ' docWidth="' + s.document.w + '" docHeight="' + s.document.h + '">\n';
+    Object.keys(s.counts).forEach(function (k) {
+      x += '    <count type="' + esc(k) + '">' + s.counts[k] + '</count>\n';
+    });
+    x += '  </summary>\n  <events>\n';
+    logs.forEach(function (l) {
+      x += '    <event';
+      Object.keys(l).forEach(function (k) {
+        if (k !== 'sessionId' && l[k] !== null && l[k] !== undefined) {
+          x += ' ' + k + '="' + esc(l[k]) + '"';
+        }
+      });
+      x += '/>\n';
+    });
+    x += '  </events>\n</usabilitySession>\n';
+    return x;
+  }
+
+  function download(name, text, mime) {
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: mime }));
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+  }
+
+  // ---------- canvas heatmap ----------
+  var heat = null;
+  function toggleHeatmap(type) {
+    if (heat) { heat.remove(); heat = null; return; }
+    var size = docSize();
+    var scale = Math.min(1, 4000 / Math.max(size.w, size.h)); // keep canvas size sane
+    heat = document.createElement('canvas');
+    heat.width = Math.round(size.w * scale);
+    heat.height = Math.round(size.h * scale);
+    heat.style.cssText = 'position:absolute;left:0;top:0;width:' + size.w + 'px;height:' + size.h +
+      'px;pointer-events:none;z-index:99999;opacity:.85';
+    var ctx = heat.getContext('2d');
+    var r = 40 * scale;
+    logs.filter(function (l) { return l.type === (type || 'click') || (!type && l.type === 'mousemove'); })
+      .forEach(function (l) {
+        var g = ctx.createRadialGradient(l.x * scale, l.y * scale, 0, l.x * scale, l.y * scale, r);
+        g.addColorStop(0, 'rgba(255,0,0,0.35)');
+        g.addColorStop(1, 'rgba(255,0,0,0)');
+        ctx.fillStyle = g;
+        ctx.fillRect(l.x * scale - r, l.y * scale - r, r * 2, r * 2);
+      });
+    document.body.appendChild(heat);
+  }
+
+  // ---------- public API ----------
+  window.UsabilityTracker = {
+    config: CONFIG,
+    getLogs: function () { return logs.slice(); },
+    getSummary: summary,
+    exportJSON: function () { return JSON.stringify({ summary: summary(), events: logs }, null, 2); },
+    exportXML: toXML,
+    downloadXML: function () { download('usability-' + SESSION_ID + '.xml', toXML(), 'application/xml'); },
+    downloadJSON: function () { download('usability-' + SESSION_ID + '.json', this.exportJSON(), 'application/json'); },
+    toggleHeatmap: toggleHeatmap,
+    clear: function () { logs.length = 0; pending.length = 0; reached = {}; maxScroll = 0; persist(); }
+  };
+
+  // ---------- demo wiring ----------
+  function $(id) { return document.getElementById(id); }
+  $('btn-summary').addEventListener('click', function () {
+    $('out').textContent = JSON.stringify(summary(), null, 2);
+  });
+  $('btn-heatmap').addEventListener('click', function () { toggleHeatmap('click'); });
+  $('btn-xml').addEventListener('click', function () { window.UsabilityTracker.downloadXML(); });
+})();
+  ]]></script>
+</body>
+</html>
